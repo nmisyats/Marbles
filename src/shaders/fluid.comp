@@ -1,0 +1,962 @@
+#version 430 core
+
+//[
+layout (local_size_x = 64) in;
+//]
+
+struct Pa { // Particle
+    vec4 pm; // pos_m
+    vec4 vd; // vel_d
+    vec4 fp; // for_p
+};
+//[
+layout(std430, binding=0) buffer PB { // particle buffer
+    Pa ps[];
+};
+//]
+#define R(i) ps[i].pm.xyz
+#define M(i) ps[i].pm.w
+#define V(i) ps[i].vd.xyz
+#define D(i) ps[i].vd.w
+#define F(i) ps[i].fp.xyz
+#define P(i) ps[i].fp.w
+
+layout(std430, binding=1) buffer BB { // bbox buffer
+    vec4 bboxMin;
+    vec4 bboxMax;
+    vec4 barycenter;
+    ivec4 gridSize;
+    ivec4 voxelRanges[];
+};
+
+layout(std430, binding=2) buffer VB { // voxel buffer
+    int voxelParticles[];
+};
+
+layout(std430, binding=3) buffer FB { // frame buffer
+    vec4 frameBuffer[];
+};
+
+layout(std430, binding=4) buffer MB { // music buffer
+    float musicBuffer[];
+};
+
+layout(location=0) uniform ivec4 params;
+layout(location=1) uniform int option;
+layout(location=2) uniform int whatGrid;
+
+const int sampleRate = 44100;
+
+ivec2 res = params.xy;
+int frame = params.z;
+float time = float(params.w)/float(sampleRate);
+
+const float PI = 3.1415926535;
+const float TWOPI = 6.28318530718;
+
+const int N_PARTICLES = 1024*4;
+const int MAX_CELLS = 32*32*32;
+const int CELL_CAPACITY = 128;
+
+const float DT = 0.01;
+const float PARTICLE_MASS = 0.1;
+const float KERNEL_RADIUS = 0.2;
+const float PRESSURE_K = 1.0;
+const float RHO0_SCALE = 20.0 / 1024.0;
+const float VISCOSITY_MU = 0.5;
+const float TENSION_SIGMA = 0.5;
+
+const float BOUNDARY_RADIUS = 2.0;
+
+const float WALL_STIFFNESS = 100.0;
+const float WALL_DAMPING = 20.0;
+const float RESTITUTION = 0.5;
+const float TANGENTIAL_DAMPING = 0.98;
+
+const int RM_MAX_STEPS = 64;
+const float RM_EPS = 0.001;
+const int TRACE_MAX_VOXELS = 92;
+const float PARTICLE_RADIUS = 0.06;
+const float SMIN_K = 0.004;
+
+const float BBOX_MARGIN = 0.1;
+const float PHYSICS_CELL_SIZE = KERNEL_RADIUS;
+const float RENDER_CELL_SIZE = 2*PARTICLE_RADIUS;
+
+int numCells = gridSize.x*gridSize.y*gridSize.z;
+
+vec3 bboxCenter = 0.5 * (bboxMin.xyz + bboxMax.xyz);
+vec3 bboxSize = bboxMax.xyz - bboxMin.xyz;
+vec3 cellSize = bboxSize / vec3(gridSize);
+vec3 bboxHalfSize = 0.5 * bboxSize;
+vec3 cellHalfSize = 0.5 * cellSize;
+
+
+
+int cellToIdx(ivec3 cell) {
+    return cell.x + cell.y * gridSize.x + cell.z * gridSize.x * gridSize.y;
+}
+
+ivec3 idxToCell(int idx) {
+    int ix =  idx % gridSize.x;
+    int iy = (idx / gridSize.x) % gridSize.y;
+    int iz =  idx / (gridSize.x * gridSize.y);
+    return ivec3(ix, iy, iz);
+}
+
+ivec3 posToCell(vec3 p) {
+    ivec3 cell = ivec3(floor((p - bboxMin.xyz) / cellSize));
+    //cell = clamp(cell, ivec3(0), ivec3(gridSize) - 1);
+    return cell;
+}
+
+vec3 cellCenter(ivec3 cell) {
+    return bboxMin.xyz + vec3(cell) * cellSize + cellHalfSize;
+}
+
+// hash function by David Hoskins: https://www.shadertoy.com/view/4djSRW
+vec3 hash33(vec3 p3) {
+	p3 = fract(p3 * vec3(.1031, .1030, .0973));
+    p3 += dot(p3, p3.yxz+33.33);
+    return fract((p3.xxy + p3.yxx)*p3.zyx);
+}
+
+// from: https://iquilezles.org/articles/morenoise/
+float noise(vec3 x) {
+    vec3 p = floor(x);
+    vec3 w = fract(x);
+
+    /*vec3 u = w*w*w*(w*(w*6.0-15.0)+10.0);
+    vec3 du = 30.0*w*w*(w*(w-1.0)+2.0);*/
+    vec3 u = smoothstep(0., 1., w);
+    vec3 du = 6.0 * w * (1.0 - w);
+    
+    vec2 q = vec2(1,0);
+    float a = hash33( p+q.yyy ).x;
+    float b = hash33( p+q.xyy ).x;
+    float c = hash33( p+q.yxy ).x;
+    float d = hash33( p+q.xxy ).x;
+    float e = hash33( p+q.yyx ).x;
+    float f = hash33( p+q.xyx ).x;
+    float g = hash33( p+q.yxx ).x;
+    float h = hash33( p+q.xxx ).x;
+
+    float k0 =   a;
+    float k1 =   b - a;
+    float k2 =   c - a;
+    float k3 =   e - a;
+    float k4 =   a - b - c + d;
+    float k5 =   a - c - e + g;
+    float k6 =   a - b - e + f;
+    float k7 = - a + b + c - d + e - f - g + h;
+
+    return k0 + k1*u.x + k2*u.y + k3*u.z + k4*u.x*u.y + k5*u.y*u.z + k6*u.z*u.x + k7*u.x*u.y*u.z;
+}
+
+mat2 rot(float a) {
+    float c = cos(a);
+    float s = sin(a);
+    return mat2(c, -s, s, c);
+}
+
+// from: https://iquilezles.org/articles/intersectors/
+vec2 boxIntersect(vec3 ro, vec3 inv_rd, vec3 c, vec3 b)  {
+    vec3 n = inv_rd*(ro-c);
+    vec3 k = abs(inv_rd)*b;
+    vec3 t1 = -n - k;
+    vec3 t2 = -n + k;
+    float tN = max( max( t1.x, t1.y ), t1.z );
+    float tF = min( min( t2.x, t2.y ), t2.z );
+    if( tN>tF || tF<0.0) return vec2(-1.0);
+    return vec2( tN, tF );
+}
+
+// SPH simulation
+// Particle-Based Fluid Simulation for Interactive Applications
+// Muller et al. 2003
+
+float Wpoly6(vec3 rvec, float h) {
+    float r = length(rvec);
+    if (r <= h) {
+        float h3 = h*h*h;
+        float h9 = h3*h3*h3;
+        float hr = h*h - r*r;
+        return (1.566/h9)*hr*hr*hr; // (315/(64*PI*h9))
+    }
+    return 0;
+}
+
+vec4 gradLapWpoly6(vec3 rvec, float h) {
+    float r = length(rvec);
+    if (r <= h) {
+        float r2 = r*r;
+        float h2 = h*h;
+        float h3 = h2*h;
+        float h9 = h3*h3*h3;
+        float hr = h*h - r*r;
+        float factor = -(9.4/h9); // -(945/(32*PI*h9))
+        float l = (h2-r2)*(3*h2 - 7*r2);
+        vec3 g = hr*hr*rvec;
+        return factor*vec4(g, l);
+    }
+    return vec4(0);
+}
+
+vec3 gradWspiky(vec3 rvec, float h) {
+    float r = length(rvec);
+    if(r <= h && r > 1e-3) {
+        float h3 = h*h*h;
+        float h6 = h3*h3;
+        float hr = h - r;
+        float factor = -(14.324/h6)*hr*hr/r; // -(45/(PI*h6))
+        return factor * rvec;
+    }
+    return vec3(0);
+}
+
+float lapWviscosity(vec3 rvec, float h) {
+    float r = length(rvec);
+    if(r <= h) {
+        float h3 = h*h*h;
+        float h6 = h3*h3;
+        return (14.324/h6)*(h-r); // (45/(PI*h6))
+    }
+    return 0;
+}
+
+ivec2 getNeighborRange(ivec3 c, int ni) {
+    ivec3 t = ivec3(ni, ni/3, ni/9) % 3;
+    ivec3 n = c + min(t,1)*(1-2*(t/2));
+    /*if(any(lessThan(n, ivec3(0))) || any(greaterThan(n, gridSize.xyz-1))) {
+        return ivec2(0);
+    }*/
+    ivec3 n0 = clamp(n, ivec3(0), gridSize.xyz-1);
+    if(all(equal(n0, n))) return voxelRanges[cellToIdx(n0)].xy;
+    return ivec2(0);
+}
+
+ivec2 getNeighborRange(int i, int ni) {
+    ivec3 c = posToCell(R(i));
+    return getNeighborRange(c, ni);
+}
+
+void computePressureAndDensity(int i) {
+    // compute density and pressure at particle i
+    const float h = KERNEL_RADIUS;
+    float rho = 0.;
+    /*for(uint j = 0; j < N_PARTICLES; j++) {
+        rho += M(j) * Wpoly6(R(i) - R(j), h);
+    }*/
+    for (int oi = 0; oi < 27; oi++) {
+        ivec2 range = getNeighborRange(i, oi);
+        for(int s = range.x; s < range.y; s++) {
+            int j = voxelParticles[s];
+            rho += M(j) * Wpoly6(R(i) - R(j), h);
+        }
+    }
+    float rho0 = RHO0_SCALE * float(N_PARTICLES);
+    D(i) = rho; // density
+    P(i) = PRESSURE_K*(rho - rho0); // pressure
+}
+
+void computePressureForce(int i) {
+    const float h = KERNEL_RADIUS;
+    vec3 fPressure = vec3(0.);
+    /*for(uint j = 0; j < N_PARTICLES; j++) {
+        float factor = M(j) * (P(i) + P(j)) / (2.*D(j));
+        vec3 fij = gradWspiky(R(i) - R(j), h);
+        fPressure += factor * fij;
+    }*/
+    for (int oi = 0; oi < 27; oi++) {
+        ivec2 range = getNeighborRange(i, oi);
+        for(int s = range.x; s < range.y; s++) {
+            int j = voxelParticles[s];
+            float factor = M(j) * (P(i) + P(j)) / (2.*D(j));
+            vec3 fij = gradWspiky(R(i) - R(j), h);
+            fPressure += factor * fij;
+        }
+    }
+    F(i) -= fPressure;
+}
+
+void computeViscosityForce(int i) {
+    const float h = KERNEL_RADIUS;
+    vec3 fViscosity = vec3(0.);
+    /*for(uint j = 0; j < N_PARTICLES; j++) {
+        vec3 fij = (V(j) - V(i)) * M(j) / D(j);
+        fij *= lapWviscosity(R(i) - R(j), h);
+        fViscosity += fij;
+    }*/
+    for (int oi = 0; oi < 27; oi++) {
+        ivec2 range = getNeighborRange(i, oi);
+        for(int s = range.x; s < range.y; s++) {
+            int j = voxelParticles[s];
+            vec3 fij = (V(j) - V(i)) * M(j) / D(j);
+            fij *= lapWviscosity(R(i) - R(j), h);
+            fViscosity += fij;
+        }
+    }
+    F(i) += VISCOSITY_MU*fViscosity;
+}
+
+void computeSurfaceTensionForce(int i) {
+    const float h = KERNEL_RADIUS;
+    // compute surface tension force
+    // 1. compute normal vector
+    vec4 nl = vec4(0);
+    /*for(uint j = 0; j < N_PARTICLES; j++) {
+        float factor = M(j) / D(j);
+        vec3 nij = factor * gradWpoly6(R(i) - R(j), h);
+        n += nij;
+        lap += factor * lapWpoly6(R(i) - R(j), h);
+    }*/
+    for (int oi = 0; oi < 27; oi++) {
+        ivec2 range = getNeighborRange(i, oi);
+        for(int s = range.x; s < range.y; s++) {
+            int j = voxelParticles[s];
+            float factor = M(j) / D(j);
+            nl += factor * gradLapWpoly6(R(i) - R(j), h);
+        }
+    }
+    // 2. compute tension force
+    vec3 n = nl.xyz;
+    float lap = nl.w;
+    if(dot(n,n) > 1e-2) {
+        F(i) -= TENSION_SIGMA*lap*normalize(n);
+    }
+}
+
+bool T(float t, inout float x, float s, float e) {
+    //t = floor(t/(4*DT))*4*DT;
+    x = (t - s) / (e - s);
+    return t >= s && t < e;
+}
+
+void computeExternalForces(int i) {
+    vec3 fExt = vec3(0);
+
+    vec3 p = R(i);
+    vec3 v = V(i);
+    vec3 u = normalize(p);
+    float r = length(p);
+    float x = 0.;
+
+    if(T(time,x,0,10)) {
+        fExt = -0.1*r*u;
+    }
+    if(T(time,x,10,20)) {
+        fExt = vec3(0., mix(0., -0.3, smoothstep(0., 0.1, x)), 0.);
+    }
+    if(T(time,x,20,40)) {
+        fExt = vec3(0., -0.3, 0.);
+        mat2 m = rot(5.*x);
+        fExt.xy *= m;
+        fExt.zx *= m;
+    }
+    if(T(time,x,40,60)) {
+        fExt = -0.1*r*u*smoothstep(0.,0.5,x);
+    }
+    if(T(time,x,60,80)) {
+        vec3 h = vec3(0,1,0);
+        float y = 5.*x;
+        h.xy *= rot(y);
+        h.zx *= rot(y);
+        fExt = -3.*dot(p,h)*h + 0.1*r*u;
+    }
+    if(T(time,x,80,100)) {
+        fExt = -0.1*r*u;
+    }
+    if(T(time,x,100,120)) {
+        fExt = 1.*(0.5/(0.5+r))*u;
+    }
+    if(T(time,x,120,121)) {
+        fExt = -0.5*r*u;
+    }
+    if(T(time,x,130,160)) {
+        fExt = vec3(0., -0.25, 0.)*sin(x*5.*2.*PI);
+        mat2 m = rot(2.*x);
+        fExt.xy *= m;
+        fExt.zx *= m;
+    }
+    if (r > BOUNDARY_RADIUS) {
+        float vn = dot(u, v);
+        fExt += -WALL_STIFFNESS*(r-BOUNDARY_RADIUS)*u - WALL_DAMPING*vn*u;
+    }
+
+    F(i) += fExt*max(D(i), 1e-6) - 10.*v;
+}
+
+void updateEulerStep(int i) {
+    // compute acceleration
+    vec3 f = F(i);
+    vec3 a = f / max(D(i), 1e-6);
+
+    // update pos/vel with semi-implicit Euler step
+    // TODO: better integration
+    vec3 r_old = R(i);
+    vec3 v_old = V(i);
+    vec3 v_new = v_old + a*DT;
+    vec3 r_new = r_old + v_new*DT;
+
+    // boundary
+    if (length(r_new) > BOUNDARY_RADIUS) {
+        vec3 u = normalize(r_new);
+        r_new = u * BOUNDARY_RADIUS;
+        float vn = dot(v_new, u);
+        vec3 vNormal = vn * u;
+        vec3 vTangent = v_new - vNormal;
+
+        if (vn > 0.0) {
+            vNormal *= -RESTITUTION;
+        }
+
+        v_new = vNormal + vTangent*TANGENTIAL_DAMPING;
+    }
+
+    R(i) = r_new;
+    V(i) = v_new;
+}
+
+void initParticle(int i) {
+    int n = N_PARTICLES;
+    int nx = int(ceil(pow(float(n), 1.0 / 3.0)));
+    int ny = nx;
+    int nz = int(ceil(float(n) / float(nx * ny)));
+
+    int ix = i % nx;
+    int iy = (i / nx) % ny;
+    int iz = i / (nx * ny);
+
+    vec3 denom = max(vec3(nx,ny,nz)-1, vec3(1));
+    vec3 uvw = vec3(ix, iy, iz) / denom;
+    R(i) = mix(vec3(-1.0), vec3(1.0), uvw);
+    V(i) = vec3(0);
+    M(i) = PARTICLE_MASS * (1 - 0.5*hash33(vec3(i)).x);
+    //M(i) = PARTICLE_MASS;
+}
+
+/*ivec4 gridForWidth(float w) {
+    vec3 L = bboxMax.xyz - bboxMin.xyz;
+    ivec3 n = max(ivec3(1), ivec3(round(L / w)));
+    return ivec4(n, n.x*n.y*n.z);
+}*/
+
+ivec3 computeBestGridSize() {
+    float targetCellSize = whatGrid == 0 ? PHYSICS_CELL_SIZE : RENDER_CELL_SIZE;
+    vec3 L = bboxMax.xyz - bboxMin.xyz;
+    ivec3 n = max(ivec3(1), ivec3(round(L / targetCellSize)));
+    n = n.x*n.y*n.z <= MAX_CELLS ? n : ivec3(32);
+    return n;
+
+    /*ivec4 n0 = gridForWidth(targetCellSize);
+    if (n0.w <= MAX_CELLS) {
+        return n0.xyz;
+    }
+    return ivec3(32,32,32);*/
+
+    /*vec3 L = bboxMax.xyz - bboxMin.xyz;
+    float lo = targetCellSize;
+    float hi = max(L.x, max(L.y, L.z));
+
+    for (int i = 0; i < 64; i++) {
+        float mid = 0.5 * (lo + hi);
+        ivec4 n = gridForWidth(mid);
+        if (n.w <= MAX_CELLS) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+
+    return gridForWidth(hi).xyz;*/
+}
+
+const int maxCurrParticles = 32;
+vec4 currentParticles[maxCurrParticles];
+int nCurrParticles = 0;
+int currentCellIdx = -1;
+
+void updateCurrentCell(vec3 p) {
+    ivec3 c = posToCell(p);
+    int idx = cellToIdx(c);
+    if (idx == currentCellIdx) return;
+
+    currentCellIdx = idx;
+    nCurrParticles = 0;
+
+    int flag = voxelRanges[idx].z;
+    if (flag == 0) return;
+
+    vec3 cc = cellCenter(c);
+    for (int oi = 0; oi < 27; oi++) {
+        if ((flag & (1 << oi)) != 0) {
+            ivec2 range = getNeighborRange(c, oi);
+            for(int s = range.x; s < range.y; s++) {
+                vec4 p = ps[voxelParticles[s]].pm;
+                float r = 1.3*PARTICLE_RADIUS*p.w/PARTICLE_MASS;
+                vec3 q = max(abs(p.xyz - cc) - cellHalfSize, 0);
+                if(dot(q,q) < r*r){
+                    currentParticles[nCurrParticles++] = p;
+                    if (nCurrParticles == maxCurrParticles) return;
+                }
+            }
+        }
+    }
+}
+
+// from: https://iquilezles.org/articles/smin/
+vec4 smin(vec4 a, vec4 b, float k) {
+    k *= 4.0;
+    float h = max(k-abs(a.w-b.w),0.0)/(2.0*k);
+    return vec4(mix(a.xyz,b.xyz,(a.w<b.w)?h:1.0-h),
+                min(a.w,b.w)-h*h*k);
+}
+
+vec4 map(vec3 p) {
+    // assuming p is within a non empty voxel neighborhood
+    updateCurrentCell(p);
+    vec4 gd = vec4(100);
+    for(int i = 0; i < nCurrParticles; i++) {
+        vec4 ci = currentParticles[i];
+        vec3 ri = p - ci.xyz;
+        float di = length(ri) - PARTICLE_RADIUS*ci.w/PARTICLE_MASS;
+        gd = smin(gd, vec4(ri, di), SMIN_K);
+    }
+    return gd;
+}
+
+// returns non-unit normal, distance
+vec4 raymarch(vec3 ro, vec3 rd, float tmin, float tmax, inout float shad) {
+    // assumes ro is inside the bounding box
+    float t = tmin;
+    for(int i = 0; i < RM_MAX_STEPS && t < tmax; i++){
+        vec4 m = map(ro + rd*t);
+        float d = abs(m.w);
+        if(d < RM_EPS){
+            shad = 0.;
+            return vec4(m.xyz, t);
+        }
+        shad = min(shad, 32.*d/max(t, 1e-3));
+        t += d;
+    }
+    return vec4(-1);
+}
+
+vec4 sceneIntersect(vec3 ro, vec3 rd, out float shad) {
+    vec3 inv_rd = 1.0/rd;
+    vec2 bbox = boxIntersect(ro, inv_rd, bboxCenter, bboxHalfSize-1e-3);
+    // traverse the grid inside the bounding box
+    shad = 1.0;
+    float t = max(bbox.x, 0); // ensure ray starts at or after ro
+    vec4 hit = vec4(-1);
+    for(int i = 0; i < TRACE_MAX_VOXELS && t < bbox.y; i++) { // if no bbox intersect, bbox.y < 0 < t, so this is skipped
+        vec3 p = ro + rd*t;
+        ivec3 cell = posToCell(p);
+        float exit = boxIntersect(p, inv_rd, cellCenter(cell), cellHalfSize).y;
+        vec4 rm = raymarch(ro, rd, t, t + exit, shad);
+        if(rm.w >= 0){ // hit during raymarch
+            return rm;
+        }
+        t += exit + 1e-3; // ensure exit this voxel
+    }
+    return vec4(-1);
+}
+
+mat3 buildBasis(vec3 N) {
+    vec3 T = normalize(cross(N, abs(N.z) > 0.99 ? vec3(1,0,0) : vec3(0,0,1)));
+    vec3 B = normalize(cross(N, T));
+    return mat3(T, B, N);
+}
+
+
+// PBR from: https://learnopengl.com/PBR/Theory
+
+float D_GGX(vec3 N, vec3 H, float a) {
+    float a2 = a*a;
+    float NdotH = max(dot(N, H), 0.);
+    float NdotH2 = NdotH*NdotH;
+    float nom = a2;
+    float denom = (NdotH2 * (a2 - 1.) + 1.);
+    denom = PI * denom * denom;
+    return nom / denom;
+}
+
+float G_SchlickGGX(float NdotV, float k) {
+    float nom = NdotV;
+    float denom = NdotV * (1 - k) + k;
+    return nom / denom;
+}
+  
+float G_Smith(vec3 N, vec3 V, vec3 L, float k) {
+    float NdotV = max(dot(N, V), 0.);
+    float NdotL = max(dot(N, L), 0.);
+    float ggx1 = G_SchlickGGX(NdotV, k);
+    float ggx2 = G_SchlickGGX(NdotL, k);
+    return ggx1 * ggx2;
+}
+
+vec3 F_Schlick(float cosTheta, vec3 F0) {
+    return F0 + (1 - F0) * pow(1. - cosTheta, 5.);
+}
+
+vec3 sampleHemisphereDir(vec2 seed) {
+    float z = seed.x;
+    float phi = 2. * PI * seed.y;
+    float r = sqrt(max(0., 1. - z * z));
+    return vec3(r*cos(phi), r*sin(phi), z);
+}
+
+float calcAO(vec3 p, vec3 n) {
+    const int N = 4;
+    const float R = PARTICLE_RADIUS*2;
+    const float eps = 0.01;
+    const float falloff = 0.09;
+
+    float occ = 0.0;
+
+    vec3 p0 = p + n * eps;
+
+    mat3 TBN = buildBasis(n);
+
+    for (int j = 0; j < N; ++j) {
+        vec3 seed = hash33((p + fract(time) + j)*47);
+        vec3 dir = sampleHemisphereDir(seed.xy);
+        dir = TBN * dir;
+
+        float u = seed.z;
+        float r = R * pow(u, 1.0 / 3.0); // uniform in hemisphere volume
+
+        vec3 x = p0 + dir * r;
+        float d = map(x).w;
+
+        float blocked = 1.0 - smoothstep(0.0, falloff, d);
+        occ += blocked;
+    }
+
+    float ao = 1.0 - occ / float(N);
+    return clamp(ao, 0.0, 1.0);
+}
+
+const vec3 LIGHT_DIR = normalize(vec3(1,1,-1));
+const vec3 SUN_COL = vec3(1);
+const vec3 SKY_COL = vec3(0.4, 0.7, 1.0);
+const float SUN_STRENGTH = 5;
+
+vec4 render(vec3 ro, vec3 rd){
+    float shad;
+
+    // primary ray
+    vec4 hit = sceneIntersect(ro, rd, shad);
+    float tprim = hit.w;
+    if (tprim < 0.) {
+        return vec4(mix(SKY_COL, SUN_COL, 0.5*dot(rd, LIGHT_DIR) + 0.5), 0);
+    }
+
+    vec3 p = ro + rd * tprim;
+
+    vec3 N = normalize(hit.xyz);
+    vec3 V = -rd;
+    vec3 L = LIGHT_DIR;
+    vec3 H = normalize(V + L);
+    vec3 eps = N*2*RM_EPS;
+
+    vec3 q = p - barycenter.xyz;
+    float g = smoothstep(0.7, 1.5, length(q));
+    float a = 0.1*time;
+    q.xz *= rot(a);
+    q.zy *= rot(a);
+    q *= 10.;
+    float nn = noise(q);
+    float f = step(0.5, nn);
+    //float s = smoothstep(0.55,0.5,nn);
+
+    vec3 albedo = mix(mix(vec3(1), vec3(1,0.5, 0.6), g), vec3(1.0,1.0,0.7), f);
+    //float roughness = mix(mix(0.5, 0.2, f), 0.05, s*f);
+    float roughness = mix(0.5, 0.2, f);
+
+    vec3 F0 = mix(vec3(0.04), albedo, f);
+    
+    // shadows
+    hit = sceneIntersect(p + eps, L, shad);
+    vec3 Li = shad * SUN_STRENGTH * SUN_COL;
+    
+    // cook-torrance BRDF
+    float ND = D_GGX(N, H, roughness);
+    float G = G_Smith(N, V, L, roughness);
+    vec3 F = F_Schlick(max(dot(H, V), 0.), F0);
+    
+    vec3 kS = F;
+    vec3 kD = vec3(1) - kS;
+    kD *= 1 - f;
+
+    // add to outgoing radiance Lo
+    float NdotL = max(dot(N, L), 0.);
+    float NdotV = max(dot(N, V), 0.);
+    vec3 diffuse = kD * albedo / PI;
+    vec3 specular = ND * G * F / (4.*NdotV*NdotL + 0.0001);
+    vec3 Lo = (diffuse + specular)*Li*NdotL + SKY_COL*albedo*calcAO(p, N);
+
+    return vec4(Lo, tprim);
+}
+
+const float dur = 5.0;
+const float off = 0.28;
+float musicTime = 0;
+float musicTimeLoop = 0;
+
+vec4 FM(vec4 fc, vec4 fm, float iom) {
+    return sin(TWOPI*fract(fc*musicTime) + iom*sin(TWOPI*fract(fm*musicTime)));
+}
+
+float chord(ivec4 ns) {
+    vec4 f = 440. * pow(vec4(2.), vec4(ns - 69) / 12.);
+    vec4 s = FM(f, f, 0.65) * 0.15
+        + FM(2.0*f, f, 0.40) * 0.06
+        + FM(f, 2.0*f, 0.45) * 0.025
+        + FM(0.5*f, f, 0.25) * 0.015;
+    return dot(s,vec4(1));
+}
+
+void fade(ivec4 c, float i, inout float s) {
+    s = mix(s, chord(c), smoothstep((i-1)*dur + off, i*dur, musicTimeLoop));
+}
+
+void generateMusic(int id) {
+    int numSamples = musicBuffer.length();
+    int samplesPerInvoc = 1024;
+    float maxAmplitude = 32767./16.; // must be less or equal than 32767
+
+    int start = id * samplesPerInvoc;
+    int end = min(start + samplesPerInvoc, numSamples);
+    if (start >= numSamples) return;
+
+    for(int i = start; i < end; i++) {
+        musicTime = float(i)/float(sampleRate);
+        musicTimeLoop = mod(musicTime, 10*dur);
+        float s = chord(ivec4(55, 60, 62, 65));
+        fade(ivec4(55, 60, 64, 67), 1.0 - off / dur, s);
+        fade(ivec4(57, 60, 64, 71), 1, s);
+        fade(ivec4(57, 60, 65, 67), 2, s);
+        fade(ivec4(55, 60, 64, 67), 3, s);
+        fade(ivec4(57, 60, 62, 65), 4, s);
+        fade(ivec4(57, 60, 65, 69), 5, s);
+        fade(ivec4(55, 60, 62, 67), 6, s);
+        fade(ivec4(60, 64, 69, 72), 7, s);
+        fade(ivec4(59, 62, 67, 71), 8, s);
+        fade(ivec4(57, 60, 64, 69), 9, s);
+        fade(ivec4(55, 60, 62, 65), 10, s);
+        s *= smoothstep(0., 1., musicTime)*smoothstep(180., 175., musicTime);
+        musicBuffer[i] = clamp(s, -1., 1.) * maxAmplitude;
+    }
+}
+
+// used for parallel bbox reduction
+/*shared vec3 sPosMin[gl_WorkGroupSize.x];
+shared vec3 sPosMax[gl_WorkGroupSize.x];*/
+
+void main()
+{
+    /*uvec3 gs = gl_NumWorkGroups * gl_WorkGroupSize;
+    uvec3 gi = gl_GlobalInvocationID;
+    int gid = int(gi.x + gs.x * (gi.y + gs.y * gi.z));*/
+    int gid = int(gl_GlobalInvocationID.x);
+
+    // fluid simulation steps
+    // one invocation per particle
+
+    // init particles
+    if (option == 0) {
+        //if (gid >= N_PARTICLES) return; // N_PARTICLES should be a multiple of the workgroup size
+        initParticle(gid);
+    }
+    // physics update
+    if (option == 1) {
+        //if (gid >= N_PARTICLES) return;
+        F(gid) = vec3(0);
+        computePressureAndDensity(gid);
+    }
+    if(option == 2) {
+        //if (gid >= N_PARTICLES) return;
+        computePressureForce(gid);
+        computeViscosityForce(gid);
+    }
+    if(option == 3) {
+        //if (gid >= N_PARTICLES) return;
+        computeSurfaceTensionForce(gid);
+        computeExternalForces(gid);
+        updateEulerStep(gid);
+    }
+
+    // determine bbox ranges
+    // single workgroup
+    if (option == 4) {
+        if(gid != 0) return;
+
+        vec3 posMin = R(0);
+        vec3 posMax = R(0);
+        vec3 center = R(0);
+        for(int i = 1; i < N_PARTICLES; i++) {
+            posMin = min(posMin, R(i));
+            posMax = max(posMax, R(i));
+            center += R(i);
+        }
+        bboxMin.xyz = posMin - BBOX_MARGIN;
+        bboxMax.xyz = posMax + BBOX_MARGIN;
+        barycenter.xyz = center / float(N_PARTICLES);
+        gridSize.xyz = computeBestGridSize();
+        
+        /*vec3 posMin = R(gid);
+        vec3 posMax = R(gid);
+        const int stride = int(gl_WorkGroupSize.x);
+        for(int i = gid + stride; i < N_PARTICLES; i += stride) {
+            posMin = min(posMin, R(i));
+            posMax = max(posMax, R(i));
+        }
+        sPosMin[gid] = posMin;
+        sPosMax[gid] = posMax;
+        
+        memoryBarrierShared();
+        barrier();
+
+        if (gid == 0) {
+            posMin = sPosMin[0];
+            posMax = sPosMax[0];
+            for (int i = 1; i < gl_WorkGroupSize.x; i++) {
+                posMin = min(posMin, sPosMin[i]);
+                posMax = max(posMax, sPosMax[i]);
+            }
+            bboxMin.xyz = posMin - BBOX_MARGIN;
+            bboxMax.xyz = posMax + BBOX_MARGIN;
+            gridSize.xyz = computeBestGridSize();
+        }*/
+    }
+    // clean voxels particle arrays
+    // one invocation per voxel
+    if (option == 5) {
+        if (gid >= numCells) return;
+        int start = gid * CELL_CAPACITY;
+        voxelRanges[gid].x = start;
+        voxelRanges[gid].y = start;
+    }
+    // assign each particle to its container voxel
+    // one invocation per particle
+    if (option == 6) {
+        //if (gid >= N_PARTICLES) return;
+
+        int i = cellToIdx(posToCell(R(gid)));
+        int j = atomicAdd(voxelRanges[i].y, 1); // assuming cell capacity is large enough
+        voxelParticles[j] = gid;
+        
+        /*int i = cellToIdx(posToCell(R(gid)));
+        int start = voxelRanges[i].x;
+        int lim = start + CELL_CAPACITY;
+        
+        int old, new, prev;
+        do {
+            old = voxelRanges[i].y;
+            new = min(old + 1, lim);
+            prev = atomicCompSwap(voxelRanges[i].y, old, new);
+        } while (prev != old);
+        
+        if (prev < lim) {
+            voxelParticles[prev] = gid;
+        }*/
+    }
+
+    if (option == 7) {
+        if (gid >= numCells) return;
+        
+        ivec3 c = idxToCell(gid);
+        int flag = 0;
+        for (int oi = 0; oi < 27; oi++) {
+            ivec2 range = getNeighborRange(c, oi);
+            if(range.y > range.x) {
+                flag = flag | (1 << oi);
+            }
+        }
+        voxelRanges[gid].z = flag;
+    }
+
+    // render
+    if (option == 8) {
+        if (gid >= frameBuffer.length()) return;
+
+        vec2 fres = vec2(res);
+        vec2 uv = vec2(gid % res.x, gid / res.x)/fres;
+        uv -= 0.5;
+        uv.x *= fres.x/fres.y;
+
+        float ht = floor(time*0.5)*94.37;
+        vec3 ft = vec3(ht);
+        vec3 h1 = hash33(ft + 1713.3);
+        vec3 h2 = hash33(ft + 7130.7);
+        vec3 h3 = hash33(ft + 9031.4);
+
+        vec3 eye = barycenter.xyz + mix(2.7, 5., h1.x) * normalize(h2);
+        float rv = (2.*h1.y-1.)*0.2;
+        eye.xz *= rot(rv*time);
+        vec3 target = barycenter.xyz + 0.3*(2.*h3-1.);
+        vec3 f = normalize(target - eye);
+        vec3 r = normalize(cross(f, vec3(0, 1, 0)));
+        mat3 cam = mat3(r, normalize(cross(r, f)), f);
+        vec3 ro = eye;
+        vec3 rd = cam * normalize(vec3(uv, 1.));
+
+        // anti aliasing
+        mat3 rdTBN = buildBasis(rd);
+        vec2 h = hash33((rd + fract(time))).xy;
+        vec2 aa = 0.0005 * (2.*h - 1.);
+        rd = normalize(rd + rdTBN * vec3(aa,0));
+        
+        vec4 col = render(ro, rd);
+        vec4 prevCol = frameBuffer[gid];
+        vec4 mixCol = mix(prevCol, col, 0.7);
+        col = mix(col, mixCol, min(frame, 1));
+        col *= smoothstep(0., 2., time)*smoothstep(180., 175., time);
+        frameBuffer[gid] = col;
+
+        // vec3 ro = vec3(0,0,-5);
+        // vec3 rd = normalize(vec3(uv, 1.));
+        // ro.xz *= rot(0.2*time);
+        // rd.xz *= rot(0.2*time);
+        // vec3 col = vec3(0.5,0.6,0.7); // sky by default
+        // vec3 inv_rd = 1.0/rd;
+        // vec2 bbox = boxIntersect(ro, inv_rd, bboxCenter, bboxHalfSize);
+        // if(bbox.y > 0){
+        //     float t = bbox.x;
+        //     for(int i = 0; i < TRACE_MAX_VOXELS && t < bbox.y; i++) {
+        //         vec3 p = ro + rd*t;
+        //         ivec3 cell = posToCell(p);
+        //         int idx = cellToIdx(cell);
+        //         ivec2 range = voxelRanges[idx].xy;
+        //         if(range.y - range.x > CELL_CAPACITY) {
+        //             col = vec3(1,0,1);
+        //             break;
+        //         }
+        //         int flag = voxelRanges[idx].z;
+        //         if (flag == 0) {
+        //             col *= vec3(0,0,1);
+        //         }
+        //         float par = mod(cell.x + cell.y + cell.z, 2);
+        //         col *= mix(vec3(0.8), vec3(0.9), step(0.5, par));
+        //         vec2 hit = boxIntersect(p, inv_rd, cellCenter(cell), cellHalfSize);
+        //         // float shad;
+        //         // vec4 tm = raymarch(ro, rd, t, t + hit.y, shad);
+        //         // if(tm.w >= 0){
+        //         //     col *= vec3(1,0,0);
+        //         //     break;
+        //         // }
+        //         t += hit.y + 1e-3;
+        //     }
+        //     if(gridSize.x*gridSize.y*gridSize.z > MAX_CELLS) {
+        //         col = vec3(1,0,1);
+        //     }
+        // }
+        // frameBuffer[gid] = vec4(col, 5.);
+    }
+
+    // music
+    if (option == 9) {
+        generateMusic(gid);
+    }
+}
