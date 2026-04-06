@@ -4,9 +4,9 @@
 
 ## Links
 
-- [Pouet](TODO)
-- [Demozoo](TODO)
-- [YouTube](TODO)
+- [Pouet](https://www.pouet.net/prod.php?which=105975)
+- [Demozoo](https://demozoo.org/productions/389769/)
+- [YouTube](https://youtu.be/rAPZgHwKfoc)
 
 ## Build
 
